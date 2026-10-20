@@ -1,5 +1,5 @@
 use crate::{
-    ActiveTheme as _, Collapsible, Icon, IconName, Placement, Sizable as _, StyledExt,
+    ActiveTheme as _, Collapsible, Icon, IconName, Placement, Sizable as _, StyledExt, ThemeStyled as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     menu::{ContextMenuExt, PopupMenu},
@@ -9,7 +9,7 @@ use crate::{
 };
 use gpui::{
     AnyElement, App, ClickEvent, ElementId, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled,
+    ParentElement as _, Role, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled,
     Window, div, percentage, prelude::FluentBuilder,
 };
 use gpui_base::TestSupportExt as _;
@@ -262,11 +262,16 @@ impl SidebarItem for SidebarMenuItem {
         } else {
             None
         };
+        let focus_handle = window
+            .use_keyed_state((id.clone(), "focus"), cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
         let handler = self.handler.clone();
         let is_collapsed = self.collapsed;
         let is_active = self.active;
         let is_hoverable = !is_active && !self.disabled;
         let is_disabled = self.disabled;
+        let is_focused = !is_disabled && focus_handle.is_focused(window);
         let is_open = open_state
             .as_ref()
             .map_or(false, |s| !is_collapsed && *s.read(cx));
@@ -279,11 +284,20 @@ impl SidebarItem for SidebarMenuItem {
                 h_flex()
                     .size_full()
                     .id("item")
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(self.label.clone())
+                    .aria_selected(is_active)
+                    .when(is_submenu, |this| this.aria_expanded(is_open))
+                    .when(!is_disabled, |this| {
+                        this.track_focus(&focus_handle.tab_stop(true).tab_index(0))
+                    })
                     .overflow_x_hidden()
                     .flex_shrink_0()
                     .p_2()
                     .gap_x_2()
                     .rounded(cx.theme().radius)
+                    .when(is_focused, |this| this.focus_ring_style(window, cx))
                     .text_sm()
                     .refine_style(&self.style)
                     .when(is_hoverable, |this| {
@@ -326,6 +340,14 @@ impl SidebarItem for SidebarMenuItem {
                             .when_some(open_state.clone(), |this, open_state| {
                                 this.child(
                                     Button::new("caret")
+                                        .with_base(
+                                            gpui_base::Button::new("caret").aria_expanded(is_open),
+                                        )
+                                        .accessibility_label(format!(
+                                            "{} {} groups",
+                                            if is_open { "Collapse" } else { "Expand" },
+                                            self.label,
+                                        ))
                                         .xsmall()
                                         .ghost()
                                         .icon(
@@ -439,5 +461,146 @@ mod tests {
 
         assert!(expanded.collapsed_tooltip().is_none());
         assert!(iconless.collapsed_tooltip().is_none());
+    }
+}
+
+
+#[cfg(test)]
+mod accessibility_tests {
+    use super::*;
+    use crate::setting::{SettingGroup, SettingItem, SettingPage, Settings};
+    use gpui::{Context, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, Render, TestAppContext, VisualTestContext};
+    use gpui_base::test_support::{snapshots, ElementSnapshot};
+    use std::cell::Cell;
+
+    fn named(window: &Window, label: &str) -> ElementSnapshot {
+        let matches = snapshots(window).into_iter().filter(|s| s.label() == Some(label)).collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "expected one accessible {label}");
+        matches.into_iter().next().unwrap()
+    }
+
+    fn press(cx: &mut VisualTestContext, key: &str) {
+        let keystroke = Keystroke::parse(key).unwrap();
+        cx.simulate_event(KeyDownEvent { keystroke: keystroke.clone(), is_held: false, prefer_character_input: false });
+        cx.simulate_event(KeyUpEvent { keystroke });
+    }
+
+    struct SettingsProbe;
+    impl Render for SettingsProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Settings::new("settings-a11y-probe").pages([
+                SettingPage::new("General")
+                    .group(SettingGroup::new().title("Sessions").item(SettingItem::render(|_, _, _| div().child("Session values"))))
+                    .group(SettingGroup::new().title("Appearance").item(SettingItem::render(|_, _, _| div().child("Appearance values")))),
+                SettingPage::new("Memory").group(SettingGroup::new().item(SettingItem::render(|_, _, _| div().child("Memory values")))),
+            ])
+        }
+    }
+
+    #[gpui::test]
+    fn settings_categories_groups_and_carets_report_current_accessibility_state(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|_, _| SettingsProbe);
+        let memory = cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let general = named(window, "General");
+            assert_eq!(general.role(), Some(Role::Button));
+            assert_eq!(general.selected(), Some(true));
+            assert_eq!(general.expanded(), Some(false));
+            assert_eq!(named(window, "Memory").selected(), Some(false));
+            named(window, "Memory").bounds().center()
+        });
+        cx.simulate_click(memory, Modifiers::default());
+        let general = cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(named(window, "Memory").selected(), Some(true));
+            assert_eq!(named(window, "General").selected(), Some(false));
+            named(window, "General").bounds().center()
+        });
+        cx.simulate_click(general, Modifiers::default());
+        let sessions = cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(named(window, "General").expanded(), Some(true));
+            assert_eq!(named(window, "Collapse General groups").expanded(), Some(true));
+            assert_eq!(named(window, "Sessions").role(), Some(Role::Button));
+            named(window, "Sessions").bounds().center()
+        });
+        cx.simulate_click(sessions, Modifiers::default());
+        let caret = cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(named(window, "Sessions").selected(), Some(true));
+            assert_eq!(named(window, "General").selected(), Some(false));
+            named(window, "Collapse General groups").bounds().center()
+        });
+        cx.simulate_click(caret, Modifiers::default());
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(named(window, "General").expanded(), Some(false));
+            assert_eq!(named(window, "Expand General groups").expanded(), Some(false));
+            assert!(!snapshots(window).iter().any(|s| s.label() == Some("Sessions")));
+            // The caret must be keyboard reachable without selecting its parent.
+            for _ in 0..8 {
+                if named(window, "Expand General groups").focused() == Some(true) { break; }
+                window.focus_next(cx);
+                window.draw(cx).clear(cx);
+            }
+            assert_eq!(named(window, "Expand General groups").focused(), Some(true));
+        });
+        press(cx, "enter");
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(named(window, "General").expanded(), Some(true));
+            assert_eq!(named(window, "General").selected(), Some(false));
+            assert_eq!(named(window, "Sessions").selected(), Some(true));
+        });
+        press(cx, "space");
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(named(window, "General").expanded(), Some(false));
+            assert_eq!(named(window, "General").selected(), Some(false));
+        });
+    }
+
+    struct KeyboardProbe {
+        activations: Rc<Cell<usize>>,
+    }
+    impl Render for KeyboardProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let activations = self.activations.clone();
+            div().id("keyboard-probe").tab_group().child(
+                SidebarMenu::new().children([
+                    SidebarMenuItem::new("Enabled").on_click(move |_, _, _| activations.set(activations.get() + 1)),
+                    SidebarMenuItem::new("Disabled").disable(true).on_click(|_, _, _| panic!("disabled item activated")),
+                ]).render("keyboard-menu", window, cx)
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_keyboard_activation_is_single_and_disabled_item_is_not_focusable(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let activations = Rc::new(Cell::new(0));
+        let captured = activations.clone();
+        let (_, cx) = cx.add_window_view(move |_, _| KeyboardProbe { activations: captured });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus_next(cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(named(window, "Enabled").focused(), Some(true));
+            assert_ne!(named(window, "Disabled").focused(), Some(true));
+        });
+        for key in ["enter", "space"] {
+            press(cx, key);
+        }
+        assert_eq!(activations.get(), 2);
+        let disabled = cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus_next(cx);
+            window.draw(cx).clear(cx);
+            assert_ne!(named(window, "Disabled").focused(), Some(true));
+            named(window, "Disabled").bounds().center()
+        });
+        cx.simulate_click(disabled, Modifiers::default());
+        assert_eq!(activations.get(), 2);
     }
 }
